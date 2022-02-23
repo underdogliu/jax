@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import functools
+import warnings
 from functools import partial
 
 import numpy as np
@@ -33,6 +34,7 @@ from jax._src.lax.lax import (
     standard_primitive, standard_unop, naryop_dtype_rule, _float, _complex,
     _input_dtype, _broadcasting_select)
 from jax._src.lax import lax as lax_internal
+from jax._src.lax import svd as lax_svd
 from jax._src.lib import lapack
 
 from jax._src.lib import cuda_linalg
@@ -1359,6 +1361,50 @@ def _svd_cpu_gpu_translation_rule(gesvd_impl, ctx, avals_in, avals_out, operand,
 
   return result
 
+def _svd_tpu(a, *, full_matrices, compute_uv):
+  u, s, vh = lax_svd.svd(a)
+  return s, u, vh
+
+def _svd_tpu_translation_rule(ctx, avals_in, avals_out, operand, *,
+                              full_matrices, compute_uv):
+  operand_aval, = avals_in
+  m, n = operand_aval.shape[-2:]
+  batch_dims = operand_aval.shape[:-2]
+
+  if m == 0 or n == 0:
+    return xla.lower_fun(_empty_svd, multiple_results=True, new_style=True)(
+      ctx, avals_in, avals_out, operand, full_matrices=full_matrices,
+        compute_uv=compute_uv)
+
+  if full_matrices and m != n:
+    warnings.warn('TPU SVD not implemented for '
+                  f'full_matrices={full_matrices}. Falling back to default'
+                  'implementation.')
+    return _svd_translation_rule(ctx, avals_in, avals_out, operand,
+                                 full_matrices=full_matrices,
+                                 compute_uv=compute_uv)
+
+  if not compute_uv:
+    # TODO: modifies `lax._src.svd`(`eigh`) for only computing singular values.
+    warnings.warn('TPU SVD not implemented for '
+                  f'compute_uv={compute_uv}. Falling back to default'
+                  'implementation.')
+    return _svd_translation_rule(ctx, avals_in, avals_out, operand,
+                                 full_matrices=full_matrices,
+                                 compute_uv=compute_uv)
+
+  if len(batch_dims):
+    warnings.warn('TPU SVD not implemented for batch dimensions'
+                  f'batch_shape={batch_dims}. Falling back to default'
+                  'implementation.')
+    return _svd_translation_rule(ctx, avals_in, avals_out, operand,
+                                 full_matrices=full_matrices,
+                                 compute_uv=compute_uv)
+
+  return xla.lower_fun(_svd_tpu, multiple_results=True, new_style=True)(
+      ctx, avals_in, avals_out, operand, full_matrices=full_matrices,
+      compute_uv=compute_uv)
+
 def svd_batching_rule(batched_args, batch_dims, full_matrices, compute_uv):
   x, = batched_args
   bd, = batch_dims
@@ -1392,6 +1438,7 @@ if rocsolver is not None:
     svd_p, partial(_svd_cpu_gpu_translation_rule, rocsolver.gesvd),
     platform='gpu')
 
+xla.register_translation(svd_p, _svd_tpu_translation_rule, platform='tpu')
 
 def _tridiagonal_solve_gpu_translation_rule(ctx, avals_in, avals_out, dl, d, du,
                                             b, *, m, n, ldb, t):
